@@ -1,0 +1,19 @@
+{
+  "name": "notes-app",
+  "private": true,
+  "packageManager": "pnpm@10.0.0",
+  "scripts": {
+    "dev": "turbo run dev",
+    "dev:frontend": "turbo run dev --filter=notes-frontend",
+    "dev:backend": "turbo run dev --filter=notes-backend",
+    "build": "turbo run build",
+    "lint": "turbo run lint",
+    "docker:up": "docker compose up -d",
+    "docker:down": "docker compose down",
+    "docker:restart": "docker compose restart",
+    "db:seed": "cd apps/backend && uv run python seed.py"
+  },
+  "devDependencies": {
+    "turbo": "^2.0.0"
+  }
+}

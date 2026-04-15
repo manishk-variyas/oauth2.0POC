@@ -1,0 +1,67 @@
+services:
+  # Keycloak's Database
+  postgres:
+    image: postgres:16
+    container_name: kc-postgres
+    environment:
+      POSTGRES_DB: keycloak
+      POSTGRES_USER: keycloak
+      POSTGRES_PASSWORD: keycloak
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  # Keycloak Auth Server
+  keycloak:
+    image: quay.io/keycloak/keycloak:latest
+    container_name: kc-server
+    command: start-dev
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: keycloak
+    expose:
+      - "8080"
+    depends_on:
+      - postgres
+
+  # Notes App Database
+  notes-db:
+    image: postgres:16
+    container_name: notes-postgres
+    environment:
+      POSTGRES_DB: notes
+      POSTGRES_USER: notes
+      POSTGRES_PASSWORD: notes123
+    volumes:
+      - notesdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: notes-redis
+    ports:
+      - "6379:6379"
+
+  # Nginx Reverse Proxy
+  nginx:
+    image: nginx:latest
+    container_name: kc-nginx
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf
+    depends_on:
+      - keycloak
+
+networks:
+  default:
+    name: notes-network
+
+volumes:
+  pgdata:
+  notesdata:

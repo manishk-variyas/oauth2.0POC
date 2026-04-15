@@ -1,0 +1,29 @@
+{
+  "$schema": "https://turbo.build/schema.json",
+  "globalDependencies": [".env"],
+  "tasks": {
+    "build": {
+      "dependsOn": ["^build"],
+      "outputs": ["dist/**", "!.git/**"]
+    },
+    "lint": {
+      "dependsOn": ["^lint"]
+    },
+    "dev": {
+      "cache": false,
+      "persistent": true
+    },
+    "docker:up": {
+      "cache": false,
+      "outputs": []
+    },
+    "docker:down": {
+      "cache": false,
+      "outputs": []
+    },
+    "docker:restart": {
+      "cache": false,
+      "dependsOn": ["docker:down", "docker:up"]
+    }
+  }
+}
