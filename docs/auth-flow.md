@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document describes the complete OAuth 2.0 authentication flow implemented in our application. We use the **Authorization Code Flow with PKCE** (Proof Key for Code Exchange) combined with a **Backend-for-Frontend (BFF)** pattern.
+This document describes the complete OAuth 2.0 authentication flow implemented in our application. We use the **Authorization Code Flow with PKCE** (Proof Key for Code Exchange) combined with a **Backend-for-Frontend (BFF)** pattern with **Redis-based session management**.
 
 This is the recommended approach for browser-based applications as per [OAuth 2.0 Security Best Current Practice (RFC 9700)](https://datatracker.ietf.org/doc/html/rfc9700).
 
@@ -26,20 +26,20 @@ Think of it like this:
 ### BFF (Backend for Frontend)
 A server that sits between your website and other services. It handles all the complex auth work so your frontend doesn't have to.
 
+### Redis
+A fast in-memory database. We store user sessions here instead of in the cookie. Like a locker system - the cookie is just a key (locker number), and the actual user info is inside the locker (Redis).
+
+### Session ID
+A random string stored in a cookie. This is NOT the user data - it's just a key that lets the backend find the user data in Redis.
+
 ### Access Token
 A digital key that lets you use an API for a short time (usually 5 minutes). Like a temporary ID badge.
 
 ### Refresh Token
 A digital key that lets you get a new access token when the old one expires. Like a badge that gets you a new temporary ID badge.
 
-### ID Token
-Proof that proves who you are. Contains your user info like name and email.
-
 ### JWT (JSON Web Token)
 A special string that safely carries your info. It's like a laminated ID card - it has your info inside, and it's signed so it can't be forged.
-
-### Session Token
-Our own token that wraps all the important info together. We create this to manage your login easily.
 
 ### HttpOnly Cookie
 A special cookie that JavaScript cannot read. This protects against hackers stealing your login.
@@ -53,18 +53,6 @@ A random string that prevents CSRF attacks. It makes sure the login request came
 ### Client ID / Client Secret
 A username and password for your app to identify itself to Keycloak. Like registering your app with Google.
 
-### Confidential Client
-An app that can keep secrets. Our backend is this type - it stores the client_secret safely.
-
-### Public Client
-An app that cannot keep secrets. Browser apps are this type - the code is visible to everyone.
-
-### Authorization Code
-A temporary ticket (like a movie ticket) that proves Keycloak said "yes". You give this code to the backend to get your real token.
-
-### Token Exchange
-The moment when the backend gives the authorization code to Keycloak and gets back real tokens.
-
 ---
 
 ## Who's Involved? (The Players)
@@ -77,12 +65,14 @@ Here's who does what:
 | Frontend | Website | Shows buttons and pages |
 | Backend | API Server | Handles all the auth logic |
 | Keycloak | Identity Server | Checks your password |
+| Redis | Session Store | Stores user sessions |
 
-Think of it like a bank:
-- **You** = Customer
-- **Frontend** = The bank lobby (what you see)
-- **Backend** = The bank teller (does the work)
-- **Keycloak** = The vault (keeps the passwords)
+Think of it like a hotel:
+- **You** = Guest
+- **Frontend** = Hotel lobby (what you see)
+- **Backend** = Reception desk (does the work)
+- **Keycloak** = ID verification (checks your identity)
+- **Redis** = Hotel key cards (stores your room access)
 
 ---
 
@@ -94,8 +84,9 @@ sequenceDiagram
     participant Frontend as Frontend (React SPA)
     participant Backend as Backend (FastAPI BFF)
     participant Keycloak as Keycloak (Auth Server)
+    participant Redis as Redis (Session Store)
 
-    Note over User,Keycloak: Keys NEVER reach the browser
+    Note over User,Redis: Keys NEVER reach the browser
 
     %% Phase 1: Login starts
     User->>Frontend: 1. Click Login
@@ -116,14 +107,17 @@ sequenceDiagram
     Backend->>Keycloak: 12. POST /token
     Note over Keycloak: 13. Exchange for tokens
     Keycloak->>Backend: 14. Return tokens
-    Note over Backend: 15. Create JWT session
-    Backend->>User: 16. Set session cookie
+    Note over Backend: 15. Store session in Redis
+    Backend->>Redis: 16. Save session data
+    Backend->>User: 17. Set session_id cookie
 
     %% Phase 4: Session active
-    User->>Frontend: 17. App loads
-    Frontend->>Backend: 18. GET /api/me
-    Backend->>Frontend: 19. Return user data
-    Note over User,Frontend: 20. Logged in!
+    User->>Frontend: 18. App loads
+    Frontend->>Backend: 19. GET /api/me (with session_id cookie)
+    Backend->>Redis: 20. Look up session by ID
+    Redis->>Backend: 21. Return session data
+    Backend->>Frontend: 22. Return user data
+    Note over User,Frontend: 23. Logged in!
 ```
 
 ### Why This Architecture?
@@ -131,61 +125,39 @@ sequenceDiagram
 | Traditional (Insecure) | Our Architecture (Secure) |
 |------------------------|----------------------|
 | User -> Keycloak (direct) | User -> Backend -> Keycloak |
-| Tokens in localStorage | Tokens in server session |
-| Browser sees all tokens | Browser sees only cookie |
+| Tokens in localStorage | Tokens in Redis server |
+| Browser sees all tokens | Browser sees only session_id |
 | XSS = token theft | HttpOnly blocks XSS |
 
-## Why This Approach?
+---
 
-### Problems with Traditional Flow (Direct SPA to Keycloak)
+## Why Redis for Sessions?
 
-1. **Token exposure**: Tokens stored in localStorage are vulnerable to XSS attacks
-2. **No refresh tokens**: Browsers can't safely store refresh tokens
-3. **Client secret exposure**: Can't use confidential clients in browser
-4. **CSRF vulnerabilities**: Harder to protect against CSRF attacks
+### Old Way (JWT in Cookie - No Redis)
+```
+Cookie: session_token = JWT{user_data + refresh_token}
+```
 
-### Our Solution: BFF + PKCE
+**Problems:**
+- Can't logout user instantly (token works until it expires)
+- Can't see how many users are logged in
+- Can't track or manage sessions
+- If token is stolen, it's valid for days
 
-| Issue | Traditional | Our Solution |
-|-------|-------------|-------------|
-| Token storage | localStorage (browser) | Server-side session |
-| Refresh token | Not supported | Server-side |
-| Client type | Public client | Confidential client |
-| Security | XSS vulnerable | HttpOnly cookie |
-| PKCE | Optional | Required |
+### New Way (Redis Sessions)
+```
+Cookie: session_id = "random_string_123"
+Redis:  session:random_string_123 = {user_data, refresh_token}
+```
 
-## The Parts of Our System
+**Benefits:**
+- ✅ Instant logout - just delete from Redis
+- ✅ See active users - count Redis keys
+- ✅ Track sessions per user
+- ✅ Extend/shorten sessions anytime
+- ✅ If cookie stolen, attacker needs Redis to get data (much harder)
 
-### 1. Frontend (The Website)
-
-- Shows you the login button and pages
-- When you click login, it asks the backend to help
-- Never talks to Keycloak directly - too dangerous!
-- Uses cookies to talk to the backend
-
-### 2. Backend (The Middleman)
-
-- The "BFF" - handles all the auth work
-- Creates the login links, checks the codes
-- Keeps your tokens safe on the server
-- Sends you a simple cookie that the browser remembers
-
-### 3. Keycloak (The Gatekeeper)
-
-- Like Google login, but runs on your server
-- Keeps the user list and passwords
-- Asks for your password
-- Gives out the temporary codes
-- Sets HttpOnly secure cookies for frontend
-- Validates sessions on each request
-
-### 3. Keycloak (Authorization Server)
-
-- Manages users and credentials
-- Handles login and consent
-- Issues authorization codes
-- Exchanges codes for tokens
-- Validates client credentials
+---
 
 ## Detailed Flow
 
@@ -230,7 +202,7 @@ The backend creates a random random string like:
 state = "random-32-characters-like-A1b2c3..."
 ```
 
-**Why is "state" needed? (Simple explanation)**
+**Why is "state" needed?**
 
 This prevents a trick called CSRF (Cross-Site Request Forgery).
 
@@ -257,7 +229,7 @@ code_verifier = "random-32-char-string-like-this"
 code_challenge = "base64-hash-of-that-string"
 ```
 
-**Why is PKCE needed? (Simple explanation)**
+**Why is PKCE needed?**
 
 Imagine you send a secret code through the mail. An thief could steal it and use it before you.
 
@@ -267,36 +239,17 @@ PKCE is like:
 3. When you receive the code, you must prove you still have the password
 4. The thief doesn't have your password, so they can't use the stolen code
 
-**How it works:**
-
-| Term | What it is | Why |
-|-----|-----------|-----|
-| code_verifier | A random secret password you create | Only your server knows this |
-| code_challenge | A fingerprint of that password | Anyone can see this |
-| S256 | The method to make the fingerprint | Hash the password with math |
-
-**Simple flow:**
-1. Your server creates a secret (code_verifier)
-2. Your server creates a fingerprint of that secret (code_challenge)
-3. You send the fingerprint to Keycloak
-4. Later, when exchanging the code, you must prove you still have the secret
-5. If you don't have the secret, the exchange fails
-
 ---
 
 ### Step 5: Backend Stores in Session
 
 ```
-Session Storage:
+Session Storage (encrypted cookie):
 ├── oauth_state: "abcd..."
 └── code_verifier: "xyz..."
 ```
 
-Both values are stored in the server-side session (encrypted cookies).
-
-**Why server-side storage:**
-- Code verifier is secret and must not reach the browser
-- Allows validation when code is exchanged
+Both values are stored in the server-side session (encrypted cookies). These are only needed during login.
 
 ---
 
@@ -313,27 +266,6 @@ URL: {KEYCLOAK_URL}/realms/{REALM}/protocol/openid-connect/auth?
     code_challenge_method=S256
 ```
 
-**Parameters in the URL (explained simply):**
-
-| Parameter | What it means | Simple explanation |
-|-----------|--------------|-----------------|
-| client_id | "notes-app-client" | "This is my app" - identifies your app |
-| redirect_uri | "/auth/callback" | "Send code here" - where to send the user back |
-| response_type | "code" | "Give me a code" - not the token directly |
-| scope | "openid profile email offline_access" | "What I want access to" - permissions |
-| state | "random-string" | "I started this" - proves it was you |
-| code_challenge | "hash-of-secret" | "My fingerprint" - PKCE proof |
-| code_challenge_method | "S256" | "How I made the fingerprint" - the method |
-
-**What do all those "scope" words mean?**
-
-| Scope | What it gives access to |
-|-------|---------------------|
-| openid | Your identity (who you are) |
-| profile | Your name, picture, etc. |
-| email | Your email address |
-| offline_access | Keep you logged in for a long time |
-
 ---
 
 ### Step 7: Backend Redirects to Keycloak
@@ -344,21 +276,9 @@ Backend ───▶ Frontend ───▶ Keycloak: 302 Redirect
 
 The backend returns a `302 Found` redirect response to the browser, pointing to Keycloak's authorization endpoint.
 
-**HTTP Response:**
-```http
-HTTP/1.1 302 Found
-Location: https://keycloak.../auth?client_id=...
-```
-
-The browser automatically follows the redirect.
-
 ---
 
 ### Step 8: User Sees Keycloak Login Page
-
-```
-Browser ───▶ Keycloak: Display login form
-```
 
 The browser shows Keycloak's login page.
 
@@ -376,25 +296,11 @@ User enters their credentials on Keycloak's hosted login page.
 
 ### Step 10: Keycloak Validates Credentials
 
-```
-Keycloak: Validate username + password
-```
-
 Keycloak checks the credentials against its user database.
 
 ---
 
-### Step 11: User Approves (Consent)
-
-```
-Keycloak: Show consent screen (optional)
-```
-
-If the client requires any sensitive scopes, Keycloak shows a consent screen where the user must approve access.
-
----
-
-### Step 12: Keycloak Redirects Back with Code
+### Step 11: Keycloak Redirects Back with Code
 
 ```
 Keycloak ───▶ Frontend ───▶ Backend: 
@@ -407,7 +313,7 @@ Keycloak redirects back to our redirect_uri with:
 
 ---
 
-### Step 13: Backend Validates State
+### Step 12: Backend Validates State
 
 ```
 Backend: session["oauth_state"] == state
@@ -417,17 +323,7 @@ The backend verifies the state parameter matches what was stored in the session.
 
 ---
 
-### Step 14: Backend Removes Code Verifier
-
-```
-Backend: code_verifier = session.pop("code_verifier")
-```
-
-The code verifier is retrieved from the session and removed. It can only be used once.
-
----
-
-### Step 15: Backend Exchanges Code for Tokens
+### Step 13: Backend Exchanges Code for Tokens
 
 ```
 Backend ───▶ Keycloak: POST /token
@@ -447,11 +343,9 @@ grant_type=authorization_code
 &code_verifier={CODE_VERIFIER}
 ```
 
-**Note:** This request is made server-to-server. The client_secret never reaches the browser.
-
 ---
 
-### Step 16: Keycloak Returns Tokens
+### Step 14: Keycloak Returns Tokens
 
 Keycloak gives back these tokens:
 
@@ -466,8 +360,6 @@ Keycloak gives back these tokens:
 }
 ```
 
-**What each token means:**
-
 | Token | Like a... | What it does |
 |-------|-----------|------------|
 | access_token | Temporary ID badge | Lets you use the app for 5 minutes |
@@ -476,57 +368,56 @@ Keycloak gives back these tokens:
 
 ---
 
-### Step 17: Backend Creates Session Token
+### Step 15: Backend Creates Redis Session
 
 ```
-Backend: Create JWT session token
+Backend ───▶ Redis: SET session:{session_id} = {user_data}
 ```
 
-The backend creates a signed JWT containing:
+The backend stores session data in Redis:
 
 ```python
-payload = {
+session_data = {
     "sub": "user-id",
     "username": "john",
     "email": "john@example.com",
     "roles": ["editor"],
-    "kc_refresh_token": "eyJhbGc...",  # For token refresh
-    "exp": 1234567890
+    "kc_refresh_token": "eyJhbGc..."  # For token refresh
 }
+
+await redis.set(f"session:{session_id}", json.dumps(session_data), ex=86400)
 ```
 
-**Why wrap tokens in JWT:**
-- Single secure cookie instead of multiple tokens
-- Session data readable by backend
-- Automatic expiration handling
+**Why store in Redis:**
+- Session data is separate from the cookie
+- Can logout user instantly
+- Can track active sessions
+- Can extend/shorten sessions
 
 ---
 
-### Step 18: Backend Sets Session Cookie
+### Step 16: Backend Sets Session ID Cookie
 
 ```
-Backend ───▶ Frontend: Set-Cookie: session_token={JWT}
+Backend ───▶ Frontend: Set-Cookie: session_id={RANDOM_STRING}
 ```
 
-The backend sets a special cookie with security features:
+The backend sets a cookie with ONLY the session ID (not the actual data):
 
 ```http
-Set-Cookie: session_token=JWT; HttpOnly; Secure; SameSite=lax
+Set-Cookie: session_id=CoFTXnDW9ta1Yayx6UnyA21gnB46Tpowb7; HttpOnly; Secure; SameSite=lax
 ```
 
-**What all those settings mean:**
+**What the cookie contains:**
+- Just a random string (like "CoFTXnDW9ta1Yayx6UnyA21gnB46Tpowb7")
+- NOT the user data
+- NOT the refresh token
 
-| Setting | What it does | Why it matters |
-|--------|-------------|---------------|
-| HttpOnly | JavaScript can't read this | Stops hackers from stealing your token |
-| Secure | Only sent over HTTPS | Stops someone from intercepting it |
-| SameSite=lax | Only works on your site | Stops other sites from using it |
-| Path=/ | Works on all pages | Your whole app is logged in |
-| Max-Age=86400 | Lasts 24 hours | You stay logged in for a day |
+This is much safer - even if someone steals the cookie, they can't use it without access to Redis.
 
 ---
 
-### Step 19: Backend Redirects to Frontend
+### Step 17: Backend Redirects to Frontend
 
 ```
 Backend ───▶ Frontend: /callback
@@ -536,23 +427,39 @@ The backend redirects the browser to the frontend's callback page.
 
 ---
 
-### Step 20: Frontend Loads Authenticated View
-
-```
-Frontend: Display authenticated interface
-```
+### Step 18: Frontend Loads Authenticated View
 
 The frontend recognizes the user is logged in and displays the authenticated view.
 
 ---
 
-### Step 21: Frontend Calls User Endpoint
+### Step 19: Frontend Calls User Endpoint
 
 ```
-Frontend ───▶ Backend: GET /api/me (with cookie)
+Frontend ───▶ Backend: GET /api/me (with session_id cookie)
 ```
 
 Frontend tries to fetch user data using the session cookie.
+
+---
+
+### Step 20: Backend Looks Up Session in Redis
+
+```
+Backend ───▶ Redis: GET session:{session_id_from_cookie}
+```
+
+The backend uses the session_id from the cookie to look up data in Redis.
+
+---
+
+### Step 21: Redis Returns Session Data
+
+```
+Redis ───▶ Backend: {user_data, refresh_token}
+```
+
+Redis returns the stored session data.
 
 ---
 
@@ -573,31 +480,106 @@ Backend ───▶ Frontend: User profile
 
 ---
 
-## Token Refresh Flow
+## Session Refresh Flow (With Session Rotation)
 
-When the access token expires:
+When the access token expires, the frontend automatically calls `/auth/refresh` every 4 minutes. This does TWO things:
+1. Gets new Keycloak tokens
+2. Rotates session ID for security
 
-```
-Frontend ───▶ Backend: POST /auth/refresh
-    (with session_token cookie)
+```mermaid
+sequenceDiagram
+    participant Frontend as Frontend SPA
+    participant Backend as FastAPI Backend
+    participant Redis as Redis
+    participant Keycloak as Keycloak
 
-Backend ───▶ Keycloak: POST /token
-    grant_type=refresh_token
-    &refresh_token={KC_REFRESH_TOKEN}
-
-Keycloak ───▶ Backend: New tokens
-
-Backend ───▶ Frontend: New session_token cookie
+    Note over Frontend: Every 4 minutes (automatic)
+    Frontend->>Backend: 1. POST /auth/refresh (with session_id cookie)
+    
+    Backend->>Redis: 2. GET session:{session_id}
+    Redis->>Backend: 3. Return refresh_token
+    
+    Backend->>Keycloak: 4. POST /token (refresh_token)
+    Keycloak->>Backend: 5. Return NEW tokens
+    
+    Note over Backend: 6. CREATE NEW session (rotation!)
+    Backend->>Redis: 7. SET session:{NEW_id} = {new data}
+    
+    Note over Backend: 8. DELETE OLD session
+    Backend->>Redis: 9. DEL session:{OLD_id}
+    
+    Backend->>Frontend: 10. Set-Cookie: session_id={NEW_id}
 ```
 
 **Flow explained:**
 
-1. Frontend calls `/auth/refresh` with session cookie
-2. Backend extracts refresh_token from JWT
+1. Frontend calls `/auth/refresh` automatically every 4 minutes
+2. Backend looks up session in Redis, gets refresh_token
 3. Backend sends refresh_token to Keycloak
 4. Keycloak returns new tokens
-5. Backend creates new session JWT
-6. Frontend receives new session cookie
+5. **Backend creates NEW session with new ID** (security!)
+6. **Backend saves new session in Redis**
+7. **Backend deletes OLD session from Redis** (rotation complete!)
+8. Backend sets new cookie with new session_id
+
+**Why Session Rotation?**
+- If someone steals your cookie, they can only use it until next refresh
+- After refresh, old cookie becomes useless (session deleted)
+- Fresh session = fresh start = more secure
+
+**Frontend Implementation:**
+```javascript
+useEffect(() => {
+  if (!user) return;
+  
+  const REFRESH_INTERVAL = 4 * 60 * 1000;  // 4 minutes
+  
+  setInterval(async () => {
+    await refreshSession();  // Creates new session + rotates
+  }, REFRESH_INTERVAL);
+}, [user]);
+```
+
+---
+
+## Logout Flow
+
+```mermaid
+sequenceDiagram
+    participant User as User
+    participant Frontend as Frontend
+    participant Backend as Backend
+    participant Redis as Redis
+    participant Keycloak as Keycloak
+
+    User->>Frontend: Click Logout
+    Frontend->>Backend: POST /auth/logout (with session_id cookie)
+    
+    Backend->>Redis: GET session:{session_id}
+    Redis->>Backend: Return refresh_token
+    
+    Backend->>Keycloak: POST /logout (revoke refresh_token)
+    Keycloak->>Backend: 200 OK (token revoked)
+    
+    Backend->>Redis: DEL session:{session_id}
+    Redis->>Backend: Deleted
+    
+    Backend->>Frontend: Delete cookie + redirect to /login
+```
+
+**What happens:**
+
+1. User clicks logout
+2. Backend gets session_id from cookie
+3. Backend looks up refresh_token from Redis
+4. Backend tells Keycloak to revoke the refresh_token
+5. Backend deletes session from Redis (instant!)
+6. Backend deletes the session_id cookie
+7. User is redirected to login page
+
+**Full logout** - user is logged out from BOTH:
+- Our app (Redis + cookie deleted)
+- Keycloak (refresh token revoked - must enter password again to login)
 
 ---
 
@@ -608,6 +590,7 @@ sequenceDiagram
     participant User as User
     participant Frontend as Frontend SPA
     participant Backend as FastAPI Backend
+    participant Redis as Redis
     participant Keycloak as Keycloak
 
     %% Phase 1: Login starts
@@ -616,7 +599,7 @@ sequenceDiagram
     Frontend->>Backend: 2. GET /auth/login
     Note over Backend: 3. Generate state
     Note over Backend: 4. Generate PKCE
-    Backend->>Backend: 5. Store in session
+    Backend->>Backend: 5. Store state in session cookie
     Backend->>User: 6. Redirect to Keycloak
 
     %% Phase 2: User authenticates
@@ -632,97 +615,18 @@ sequenceDiagram
     Note over Backend: 12. Validate state
     Backend->>Keycloak: 13. POST /token
     Keycloak->>Backend: 14. Return tokens
-    Note over Backend: 15. Create JWT session
-    Backend->>User: 16. Set cookie
+    Note over Backend: 15. Store session in Redis
+    Backend->>Redis: 16. SET session:{id} = {data}
+    Backend->>User: 17. Set-Cookie: session_id={id}
 
     %% Phase 4: Active session
     Note over User,Frontend: Phase 4: Active
-    User->>Frontend: 17. App loads
-    Frontend->>Backend: 18. GET /api/me
-    Backend->>Frontend: 19. Return user data
-    Note over User,Frontend: 20. Logged in!
-```
-
----
-
-## Token Refresh Flow - Mermaid Diagram
-
-```mermaid
-sequenceDiagram
-    participant Frontend as Frontend SPA
-    participant Backend as FastAPI Backend
-    participant Keycloak as Keycloak
-
-    Note over Frontend,Keycloak: Token Refresh Flow
-
-    Frontend->>Backend: 1. POST /auth/refresh
-    Note over Backend: 2. Extract refresh_token
-    Backend->>Keycloak: 3. POST /token
-    Keycloak->>Backend: 4. Return new tokens
-    Note over Backend: 5. Update JWT session
-    Backend->>Frontend: 6. Set new cookie
-```
-
----
-
-## Visual Flow Summary
-
-```mermaid
-flowchart LR
-    subgraph A["Phase 1: Initiation"]
-        A1[1. Click Login] --> A2[2. Call /auth/login]
-        A2 --> A3[3. Generate State + PKCE]
-        A3 --> A4[4. Build Keycloak URL]
-    end
-
-    subgraph B["Phase 2: User Auth"]
-        B1[5. Redirect to Keycloak] --> B2[6. Enter Credentials]
-        B2 --> B3[7. Validate]
-        B3 --> B4[8. User Consent]
-    end
-
-    subgraph C["Phase 3: Token Exchange"]
-        C1[9. Callback with Code] --> C2[10. Validate State]
-        C2 --> C3[11. Exchange Code]
-        C3 --> C4[12. Get Tokens]
-    end
-
-    subgraph D["Phase 4: Session"]
-        D1[13. Create JWT] --> D2[14. Set Cookie]
-        D2 --> D3[15. Return to App]
-        D3 --> D4[16. Logged In]
-    end
-
-    A --> B --> C --> D
-
-    style A fill:#e3f2fd,stroke:#2196F3,stroke-width:2px
-    style B fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px
-    style C fill:#fff3e0,stroke:#FF9800,stroke-width:2px
-    style D fill:#f3e5f5,stroke:#9C27B0,stroke-width:2px
-```
-
----
-
-## Code Reference
-
-| File | Description |
-|------|------------|
-| `apps/backend/app/routes/auth.py` | OAuth 2.0 endpoints |
-| `apps/backend/app/auth/service.py` | Session token creation |
-| `apps/frontend/src/services/auth.js` | Frontend auth functions |
-
-### Key Functions from auth.py
-
-```python
-def generate_state() -> str:
-    return secrets.token_urlsafe(32)
-
-
-def generate_pkce() -> tuple[str, str]:
-    code_verifier = secrets.token_urlsafe(32)
-    digest = hashlib.sha256(code_verifier.encode()).digest()
-    code_challenge = base64.urlsafe_b64encode(digest).decode().rstrip("=")
-    return code_verifier, code_challenge
+    User->>Frontend: 18. App loads
+    Frontend->>Backend: 19. GET /api/me + cookie
+    Backend->>Redis: 20. GET session:{id}
+    Redis->>Backend: 21. Return data
+    Backend->>Frontend: 22. Return user data
+    Note over User,Frontend: 23. Logged in!
 ```
 
 ---
@@ -731,23 +635,67 @@ def generate_pkce() -> tuple[str, str]:
 
 | Threat | What it is | How we stop it |
 |--------|-----------|--------------|
-| XSS | Hacker steals your token from localStorage | HttpOnly cookie - JavaScript can't read it |
-| CSRF | Hacker tricks your browser into calling our app | SameSite cookie + state parameter |
+| XSS | Hacker steals your token | HttpOnly cookie - JavaScript can't read it |
+| CSRF | Hacker tricks your browser | SameSite cookie + state parameter |
 | Code theft | Hacker steals the login code | PKCE - requires the secret to use code |
-| Token replay | Hacker tries to reuse an old token | Code expires quickly (5 minutes) |
-| Cookie theft | Hacker steals your cookie | HttpOnly + Secure (HTTPS only) |
+| Session hijacking | Hacker steals session_id | Session stored in Redis, not in cookie |
+| Instant logout needed | User leaves device logged in | Delete from Redis, cookie becomes useless |
+
+---
 
 ## Security Best Practices We Follow
 
-1. PKCE is always used - makes the login code useless without the secret
-2. Client secret stays on server - never exposed to the browser
-3. Tokens stay on server - never in localStorage
-4. HttpOnly cookies - JavaScript can't read them
-5. Secure cookies - only sent over HTTPS (encrypted)
-6. SameSite=lax - other sites can't use your cookie
-7. State parameter - proves you started the login request
-8. Short access token - expires in 5 minutes
-9. Refresh token - lets you stay logged in without logging in again
+1. **PKCE** - makes the login code useless without the secret
+2. **Client secret stays on server** - never exposed to browser
+3. **Keycloak tokens stay in Redis** - never in cookie or localStorage
+4. **HttpOnly cookies** - JavaScript can't read them
+5. **Secure cookies** - only sent over HTTPS (encrypted)
+6. **SameSite=lax** - other sites can't use your cookie
+7. **State parameter** - proves you started the login request
+8. **Short access token** - expires in 5 minutes
+9. **Redis sessions** - can instantly logout, track users
+10. **session_id as key** - cookie is just a reference, not the data
+11. **Session rotation on refresh** - new session ID every 4 minutes (prevents session fixation)
+12. **Full logout** - revokes Keycloak token + deletes Redis session
+
+---
+
+## Code Reference
+
+| File | Description |
+|------|------------|
+| `apps/backend/app/routes/auth.py` | OAuth 2.0 endpoints |
+| `apps/backend/app/auth/redis_service.py` | Redis session operations |
+| `apps/backend/app/auth/dependencies.py` | Session verification |
+| `apps/frontend/src/services/auth.js` | Frontend auth functions |
+
+### Key Redis Functions from redis_service.py
+
+```python
+async def create_session(user_data: dict, keycloak_refresh_token: str) -> str:
+    """Create session in Redis, return session_id"""
+    session_id = generate_session_id()
+    session_data = {
+        "sub": user_data.get("sub"),
+        "username": user_data.get("username"),
+        "email": user_data.get("email"),
+        "roles": user_data.get("roles", []),
+        "kc_refresh_token": keycloak_refresh_token
+    }
+    await redis.set(f"session:{session_id}", json.dumps(session_data), ex=86400)
+    return session_id
+
+
+async def get_session(session_id: str) -> Optional[dict]:
+    """Get session data from Redis"""
+    data = await redis.get(f"session:{session_id}")
+    return json.loads(data) if data else None
+
+
+async def delete_session(session_id: str) -> bool:
+    """Delete session from Redis (logout)"""
+    return await redis.delete(f"session:{session_id}") > 0
+```
 
 ---
 

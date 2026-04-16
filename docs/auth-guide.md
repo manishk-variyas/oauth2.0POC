@@ -21,22 +21,31 @@
 │  │  (redirect) │    │ (verify auth)│    │ (api calls) │                │
 │  └─────────────┘    └──────────────┘    └─────────────┘                │
 │         │                    │                     │                    │
-└─────────┼────────────────────┼─────────────────────┼──────────────────┘
-          │                    │                     │
-          │   withCredentials  │                     │
-          ▼                    ▼                     ▼
+│         │     session_id cookie                with cookie             │
+│         ▼                    ▼                     ▼                    │
+└─────────────────────────────────────────────────────────────────────────┘
+           │                    │                     │
+           ▼                    ▼                     ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                         BACKEND (FastAPI)                               │
-│  ┌─────────────────────────────────────────────────────────────────────┐│
-│  │                        SessionMiddleware                             ││
-│  │  - Stores oauth_state for CSRF protection                           ││
-│  └─────────────────────────────────────────────────────────────────────┘│
-│          │                          │                    │
-│     /auth/login               /auth/callback         /api/* (protected)
-│          │                          │                    │
-└─────────┼──────────────────────────┼────────────────────┼─────────────┘
-          │                          │                    │
-          ▼                          ▼                    ▼
+│  ┌──────────────────┐    ┌──────────────────────┐    ┌──────────────┐ │
+│  │ SessionMiddleware│    │  /auth/callback      │    │  /api/*      │ │
+│  │ (oauth state +   │    │  (create Redis       │    │  (verify      │ │
+│  │  code_verifier)  │    │   session)           │    │   Redis)      │ │
+│  └──────────────────┘    └──────────────────────┘    └──────────────┘ │
+│                                    │                                     │
+└────────────────────────────────────┼────────────────────────────────────┘
+                                     │
+                                     ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                              REDIS                                      │
+│  ┌─────────────────────────────────────────────────────────────────────┐ │
+│  │  session:{session_id} = {sub, username, email, roles,             │ │
+│  │                         kc_refresh_token}                          │ │
+│  └─────────────────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────────────┘
+                                     │
+                                     ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                         KEYCLOAK (OIDC Provider)                        │
 │  ┌─────────────┐    ┌──────────────┐    ┌─────────────┐                │
@@ -55,32 +64,40 @@ sequenceDiagram
     participant User
     participant Frontend
     participant Backend
+    participant Redis
     participant Keycloak
 
     Note over User, Frontend: User clicks "Login"
     Frontend->>Backend: GET /auth/login
+    Note over Backend: Generate state + PKCE
     Backend->>Keycloak: Redirect with state parameter
     
     Note over User, Keycloak: User enters credentials
     Keycloak->>Frontend: Redirect with auth code
     
     Frontend->>Backend: GET /auth/callback?code=XXX&state=YYY
+    Note over Backend: Validate state from session cookie
     Backend->>Keycloak: Exchange code for tokens
     Keycloak->>Backend: access_token + refresh_token
     
-    Backend->>Backend: Create session JWT with refresh_token
-    Backend->>Frontend: Set cookie, redirect to /callback
+    Note over Backend: Store session in Redis
+    Backend->>Redis: SET session:{id} = {user_data, refresh_token}
+    Backend->>Frontend: Set-Cookie: session_id={id}, redirect to /callback
     
-    Frontend->>Backend: GET /api/me (with cookie)
+    Frontend->>Backend: GET /api/me (with session_id cookie)
+    Backend->>Redis: GET session:{id}
+    Redis->>Backend: {user_data}
     Backend->>Frontend: Return user data
     
     Note over Frontend, User: User sees dashboard
     
-    Note over User, Backend: Session expires
-    Frontend->>Backend: POST /auth/refresh
+    Note over User, Backend: Session expires / needs refresh
+    Frontend->>Backend: POST /auth/refresh (with session_id cookie)
+    Backend->>Redis: GET session:{id} -> get refresh_token
     Backend->>Keycloak: Refresh token
     Keycloak->>Backend: New tokens
-    Backend->>Frontend: New session cookie
+    Backend->>Redis: UPDATE session with new refresh_token
+    Backend->>Frontend: Success response
 ```
 
 ---
@@ -388,7 +405,7 @@ backend/
 KEYCLOAK_URL=http://localhost:8080
 REALM=notes-app
 KEYCLOAK_CLIENT_ID=notes-app-client
-KEYCLOAK_CLIENT_SECRET=  # Leave empty if using public client
+KEYCLOAK_CLIENT_SECRET=xvbAvMEWemYMwSPr6YSzjdRGG706wyCC
 
 # Session / JWT
 SECRET_KEY=cd81bb7fcea33bcd69352b5da53aa36590cb71aa140e34af8b91025749ac9b02
@@ -404,6 +421,9 @@ COOKIE_SECURE=false  # true in production with HTTPS
 
 # Database
 DATABASE_URL=postgresql://notes:notes123@localhost:5432/notes
+
+# Redis (for session storage)
+REDIS_URL=redis://localhost:6379
 ```
 
 **Generate your own SECRET_KEY:**
@@ -425,7 +445,7 @@ class Settings(BaseSettings):
     KEYCLOAK_URL: str = "http://localhost:8080"
     REALM: str = "notes-app"
     KEYCLOAK_CLIENT_ID: str = "notes-app-client"
-    KEYCLOAK_CLIENT_SECRET: str = ""  # Empty for public client
+    KEYCLOAK_CLIENT_SECRET: str = "xvbAvMEWemYMwSPr6YSzjdRGG706wyCC"
 
     # Session / JWT
     SECRET_KEY: str = "change-me-in-production"
@@ -442,6 +462,9 @@ class Settings(BaseSettings):
     # Database
     DATABASE_URL: str = "postgresql://notes:notes123@localhost:5432/notes"
 
+    # Redis (for session storage)
+    REDIS_URL: str = "redis://localhost:6379"
+
     class Config:
         env_file = ".env"
 
@@ -450,92 +473,157 @@ settings = Settings()
 
 ---
 
-### auth/dependencies.py - Current User Dependency
+### auth/dependencies.py - Get Current User (Redis-based)
 
 ```python
 from fastapi import Request, HTTPException, Depends
-from jose import jwt, JWTError
-from app.config import settings
+from app.auth.redis_service import get_session
 
 
-def get_current_user(request: Request) -> dict:
+async def get_current_user(request: Request) -> dict:
     """Get current user from session cookie"""
-    token = request.cookies.get("session_token")
-    if not token:
+    session_id = request.cookies.get("session_id")
+    if not session_id:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
-    try:
-        payload = jwt.decode(
-            token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM]
-        )
-    except JWTError:
+    session_data = await get_session(session_id)
+    if not session_data:
         raise HTTPException(status_code=401, detail="Invalid or expired session")
 
     return {
-        "sub": payload.get("sub"),
-        "username": payload.get("username"),
-        "email": payload.get("email"),
-        "roles": payload.get("roles", []),
+        "sub": session_data.get("sub"),
+        "username": session_data.get("username"),
+        "email": session_data.get("email"),
+        "roles": session_data.get("roles", []),
     }
 ```
 
 ---
 
-### auth/service.py - Token Service
+### auth/redis_service.py - Redis Session Management
 
 ```python
-from datetime import datetime, timedelta
-from jose import jwt, JWTError
+import secrets
+import json
+from typing import Optional
+import redis.asyncio as redis
 from app.config import settings
 
+redis_client = None
 
-def create_session_token(user_data: dict, keycloak_refresh_token: str = None) -> str:
-    """Create backend session JWT"""
-    expire = datetime.utcnow() + timedelta(hours=settings.SESSION_EXPIRE_HOURS)
-    payload = {
+
+async def get_redis() -> redis.Redis:
+    global redis_client
+    if redis_client is None:
+        redis_client = redis.from_url(settings.REDIS_URL, decode_responses=True)
+    return redis_client
+
+
+async def close_redis():
+    global redis_client
+    if redis_client:
+        await redis_client.close()
+        redis_client = None
+
+
+def generate_session_id() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def _session_key(session_id: str) -> str:
+    return f"session:{session_id}"
+
+
+async def create_session(
+    user_data: dict, keycloak_refresh_token: str = None, expires_hours: int = None
+) -> str:
+    """Create a new session in Redis and return session ID"""
+    session_id = generate_session_id()
+    expire_hours = expires_hours or settings.SESSION_EXPIRE_HOURS
+
+    session_data = {
         "sub": user_data.get("sub"),
         "username": user_data.get("username"),
         "email": user_data.get("email"),
         "roles": user_data.get("roles", []),
-        "exp": expire,
     }
 
     if keycloak_refresh_token:
-        payload["kc_refresh_token"] = keycloak_refresh_token
+        session_data["kc_refresh_token"] = keycloak_refresh_token
 
-    return jwt.encode(payload, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+    r = await get_redis()
+    await r.set(
+        _session_key(session_id), json.dumps(session_data), ex=expire_hours * 3600
+    )
+
+    return session_id
 
 
-def verify_session_token(token: str) -> dict:
-    """Verify and decode backend session JWT"""
-    try:
-        payload = jwt.decode(
-            token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM]
-        )
-        return payload
-    except JWTError:
-        return None
+async def get_session(session_id: str) -> Optional[dict]:
+    """Get session data from Redis"""
+    r = await get_redis()
+    data = await r.get(_session_key(session_id))
+    if data:
+        return json.loads(data)
+    return None
+
+
+async def refresh_session(session_id: str, keycloak_refresh_token: str) -> bool:
+    """Update session with new Keycloak refresh token"""
+    r = await get_redis()
+    data = await r.get(_session_key(session_id))
+    if not data:
+        return False
+
+    session_data = json.loads(data)
+    session_data["kc_refresh_token"] = keycloak_refresh_token
+
+    await r.set(_session_key(session_id), json.dumps(session_data))
+    return True
+
+
+async def delete_session(session_id: str) -> bool:
+    """Delete session from Redis (logout)"""
+    r = await get_redis()
+    result = await r.delete(_session_key(session_id))
+    return result > 0
 ```
 
 ---
 
-### routes/auth.py - Auth Endpoints
+### routes/auth.py - Auth Endpoints (Redis-based)
 
 ```python
 import secrets
+import hashlib
+import base64
+import logging
 from fastapi import APIRouter, Request, HTTPException, Depends
 from fastapi.responses import RedirectResponse, JSONResponse
 import httpx
-from jose import jwt, JWTError
+from jose import jwt
 from app.config import settings
-from app.auth.service import create_session_token
+from app.auth.redis_service import (
+    create_session,
+    get_session,
+    refresh_session as redis_refresh_session,
+    delete_session,
+)
 from app.auth.dependencies import get_current_user
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 
 def generate_state() -> str:
     return secrets.token_urlsafe(32)
+
+
+def generate_pkce() -> tuple[str, str]:
+    code_verifier = secrets.token_urlsafe(32)
+    digest = hashlib.sha256(code_verifier.encode()).digest()
+    code_challenge = base64.urlsafe_b64encode(digest).decode().rstrip("=")
+    return code_verifier, code_challenge
 
 
 def get_user_info_from_token(access_token: str) -> dict:
@@ -548,90 +636,15 @@ def get_user_info_from_token(access_token: str) -> dict:
             "roles": payload.get("realm_access", {}).get("roles", []),
         }
     except Exception as e:
+        logger.error(f"Error extracting user info: {e}")
         return {}
 
 
-@router.get("/login")
-async def login(request: Request):
-    state = generate_state()
-    request.session["oauth_state"] = state
-
-    auth_url = f"{settings.KEYCLOAK_URL}/realms/{settings.REALM}/protocol/openid-connect/auth"
-    params = {
-        "client_id": settings.KEYCLOAK_CLIENT_ID,
-        "redirect_uri": f"{settings.BACKEND_URL}/auth/callback",
-        "response_type": "code",
-        "scope": "openid profile email offline_access",
-        "state": state,
-    }
-
-    query_string = "&".join([f"{k}={v}" for k, v in params.items()])
-    return RedirectResponse(url=f"{auth_url}?{query_string}")
-
-
-@router.get("/callback")
-async def callback(code: str, state: str, request: Request):
-    # Validate state (CSRF protection)
-    saved_state = request.session.get("oauth_state")
-    if not saved_state or saved_state != state:
-        raise HTTPException(status_code=400, detail="Invalid state parameter")
-
-    request.session.pop("oauth_state", None)
-
-    # Exchange code for tokens
-    token_url = f"{settings.KEYCLOAK_URL}/realms/{settings.REALM}/protocol/openid-connect/token"
-
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            token_url,
-            data={
-                "grant_type": "authorization_code",
-                "client_id": settings.KEYCLOAK_CLIENT_ID,
-                "client_secret": settings.KEYCLOAK_CLIENT_SECRET,
-                "code": code,
-                "redirect_uri": f"{settings.BACKEND_URL}/auth/callback",
-            },
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-        )
-
-    if response.status_code != 200:
-        raise HTTPException(status_code=400, detail="Failed to exchange code for token")
-
-    tokens = response.json()
-    user_data = get_user_info_from_token(tokens.get("access_token"))
-    session_token = create_session_token(user_data, tokens.get("refresh_token"))
-
-    # Set cookie and redirect
-    redirect_response = RedirectResponse(url=f"{settings.FRONTEND_URL}/callback")
-    redirect_response.set_cookie(
-        key="session_token",
-        value=session_token,
-        httponly=True,
-        secure=settings.COOKIE_SECURE,
-        samesite="lax",
-        max_age=settings.SESSION_EXPIRE_HOURS * 3600,
-        path="/",
+async def refresh_keycloak_token(refresh_token: str) -> dict:
+    token_url = (
+        f"{settings.KEYCLOAK_URL}/realms/{settings.REALM}/protocol/openid-connect/token"
     )
-    return redirect_response
 
-
-@router.post("/refresh")
-async def refresh_session(request: Request, current_user: dict = Depends(get_current_user)):
-    token = request.cookies.get("session_token")
-    if not token:
-        raise HTTPException(status_code=401, detail="No session")
-
-    try:
-        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Invalid session")
-
-    refresh_token = payload.get("kc_refresh_token")
-    if not refresh_token:
-        raise HTTPException(status_code=401, detail="No refresh token available")
-
-    # Call Keycloak to refresh
-    token_url = f"{settings.KEYCLOAK_URL}/realms/{settings.REALM}/protocol/openid-connect/token"
     async with httpx.AsyncClient() as client:
         response = await client.post(
             token_url,
@@ -645,35 +658,162 @@ async def refresh_session(request: Request, current_user: dict = Depends(get_cur
         )
 
     if response.status_code != 200:
-        raise HTTPException(status_code=401, detail="Session expired")
+        raise HTTPException(status_code=401, detail="Failed to refresh Keycloak token")
 
-    new_tokens = response.json()
-    user_data = {
-        "sub": payload.get("sub"),
-        "username": payload.get("username"),
-        "email": payload.get("email"),
-        "roles": payload.get("roles", []),
+    return response.json()
+
+
+@router.get("/login")
+async def login(request: Request):
+    state = generate_state()
+    code_verifier, code_challenge = generate_pkce()
+
+    request.session["oauth_state"] = state
+    request.session["code_verifier"] = code_verifier
+
+    auth_url = (
+        f"{settings.KEYCLOAK_URL}/realms/{settings.REALM}/protocol/openid-connect/auth"
+    )
+    params = {
+        "client_id": settings.KEYCLOAK_CLIENT_ID,
+        "redirect_uri": f"{settings.BACKEND_URL}/auth/callback",
+        "response_type": "code",
+        "scope": "openid profile email offline_access",
+        "state": state,
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
     }
-    new_session_token = create_session_token(user_data, new_tokens.get("refresh_token"))
 
-    response = JSONResponse({"message": "Session refreshed", "user": user_data})
-    response.set_cookie(
-        key="session_token",
-        value=new_session_token,
+    query_string = "&".join([f"{k}={v}" for k, v in params.items()])
+    return RedirectResponse(url=f"{auth_url}?{query_string}")
+
+
+@router.get("/callback")
+async def callback(code: str, state: str, request: Request):
+    saved_state = request.session.get("oauth_state")
+    if not saved_state or saved_state != state:
+        raise HTTPException(status_code=400, detail="Invalid state parameter")
+
+    code_verifier = request.session.pop("code_verifier", None)
+    request.session.pop("oauth_state", None)
+
+    token_url = (
+        f"{settings.KEYCLOAK_URL}/realms/{settings.REALM}/protocol/openid-connect/token"
+    )
+
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            token_url,
+            data={
+                "grant_type": "authorization_code",
+                "client_id": settings.KEYCLOAK_CLIENT_ID,
+                "client_secret": settings.KEYCLOAK_CLIENT_SECRET,
+                "code": code,
+                "redirect_uri": f"{settings.BACKEND_URL}/auth/callback",
+                "code_verifier": code_verifier,
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+
+    if response.status_code != 200:
+        raise HTTPException(status_code=400, detail="Failed to exchange code for token")
+
+    tokens = response.json()
+    user_data = get_user_info_from_token(tokens.get("access_token"))
+    session_id = await create_session(user_data, tokens.get("refresh_token"))
+
+    redirect_response = RedirectResponse(url=f"{settings.FRONTEND_URL}/callback")
+    redirect_response.set_cookie(
+        key="session_id",
+        value=session_id,
         httponly=True,
         secure=settings.COOKIE_SECURE,
         samesite="lax",
         max_age=settings.SESSION_EXPIRE_HOURS * 3600,
         path="/",
     )
-    return response
+    return redirect_response
+
+
+@router.post("/refresh")
+async def refresh_session_endpoint(
+    request: Request, current_user: dict = Depends(get_current_user)
+):
+    session_id = request.cookies.get("session_id")
+    if not session_id:
+        raise HTTPException(status_code=401, detail="No session")
+
+    session_data = await get_session(session_id)
+    if not session_data:
+        raise HTTPException(status_code=401, detail="Session not found")
+
+    refresh_token = session_data.get("kc_refresh_token")
+    if not refresh_token:
+        raise HTTPException(status_code=401, detail="No refresh token available")
+
+    try:
+        new_tokens = await refresh_keycloak_token(refresh_token)
+    except HTTPException:
+        await delete_session(session_id)
+        raise HTTPException(
+            status_code=401, detail="Session expired, please login again"
+        )
+
+    await redis_refresh_session(session_id, new_tokens.get("refresh_token"))
+
+    user_data = {
+        "sub": session_data.get("sub"),
+        "username": session_data.get("username"),
+        "email": session_data.get("email"),
+        "roles": session_data.get("roles", []),
+    }
+
+    return JSONResponse({"message": "Session refreshed", "user": user_data})
+
+
+async def revoke_keycloak_token(refresh_token: str) -> bool:
+    """Revoke refresh token at Keycloak for proper logout"""
+    revoke_url = (
+        f"{settings.KEYCLOAK_URL}/realms/{settings.REALM}/protocol/openid-connect/logout"
+    )
+
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            revoke_url,
+            data={
+                "client_id": settings.KEYCLOAK_CLIENT_ID,
+                "client_secret": settings.KEYCLOAK_CLIENT_SECRET,
+                "refresh_token": refresh_token,
+                "grant_type": "refresh_token",
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+
+    if response.status_code in [200, 204]:
+        logger.info("Keycloak token revoked successfully")
+        return True
+    else:
+        logger.warning(f"Failed to revoke Keycloak token: {response.status_code}")
+        return False
 
 
 @router.post("/logout")
 @router.get("/logout")
-async def logout():
+async def logout(request: Request):
+    session_id = request.cookies.get("session_id")
+    
+    if session_id:
+        session_data = await get_session(session_id)
+        
+        if session_data:
+            refresh_token = session_data.get("kc_refresh_token")
+            if refresh_token:
+                await revoke_keycloak_token(refresh_token)
+        
+        await delete_session(session_id)
+
     redirect_response = RedirectResponse(url=f"{settings.FRONTEND_URL}/login")
-    redirect_response.delete_cookie("session_token")
+    redirect_response.delete_cookie("session_id")
     return redirect_response
 ```
 
@@ -766,21 +906,35 @@ def delete(
 
 ---
 
-### main.py - App Entry Point
+### main.py - App Entry Point (with Redis lifespan)
 
 ```python
 import logging
-from fastapi import FastAPI, Request
+import time
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 from app.config import settings
 from app.db import init_db
 from app.routes import auth_router, notes_router
+from app.auth.dependencies import get_current_user
+from app.auth.redis_service import close_redis
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Notes API", version="1.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("Starting up Notes API...")
+    init_db()
+    yield
+    logger.info("Shutting down Notes API...")
+    await close_redis()
+
+
+app = FastAPI(title="Notes API", version="1.0", lifespan=lifespan)
 
 app.add_middleware(SessionMiddleware, secret_key=settings.SECRET_KEY, max_age=3600)
 app.add_middleware(
@@ -790,12 +944,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-@app.on_event("startup")
-async def startup():
-    logger.info("Starting up Notes API...")
-    init_db()
 
 
 @app.get("/")
@@ -871,7 +1019,7 @@ export const checkAuth = async () => {
 
 ---
 
-## App.jsx - Auth Context
+## App.jsx - Auth Context with Session Refresh
 
 ```jsx
 import { createContext, useContext, useState, useEffect } from 'react';
@@ -880,7 +1028,7 @@ import Login from './pages/Login';
 import Home from './pages/Home';
 import Public from './pages/Public';
 import Callback from './pages/Callback';
-import { checkAuth, logout as authLogout } from './services/auth';
+import { checkAuth, refreshSession, logout as authLogout } from './services/auth';
 
 const AuthContext = createContext(null);
 
@@ -898,6 +1046,25 @@ function App() {
       setLoading(false);
     });
   }, []);
+
+  // Session refresh every 4 minutes (with session rotation!)
+  useEffect(() => {
+    if (!user) return;
+
+    const REFRESH_INTERVAL = 4 * 60 * 1000; // 4 minutes
+
+    const interval = setInterval(async () => {
+      try {
+        await refreshSession(); // Creates new session + rotates
+        console.log('Session refreshed');
+      } catch (error) {
+        console.error('Session refresh failed:', error);
+        setUser(null);
+      }
+    }, REFRESH_INTERVAL);
+
+    return () => clearInterval(interval);
+  }, [user]);
 
   const logout = async () => {
     await authLogout();
@@ -1040,7 +1207,7 @@ export default Home;
 
 ## ✅ DO
 
-1. **Use Authorization Code Flow**
+1. **Use Authorization Code Flow with PKCE**
    - More secure than Implicit or Password flow
    - Tokens never exposed to browser
 
@@ -1049,30 +1216,47 @@ export default Home;
    - Prevents cross-site request forgery
 
 3. **Use HttpOnly Cookies**
-   - Prevents XSS attacks from stealing tokens
+   - Prevents XSS attacks from stealing session_id
    - `httponly=True` in cookie settings
+   - Cookie contains only session_id, NOT user data
 
-4. **Use Strong SECRET_KEY**
+4. **Use Redis for Session Storage**
+   - Session data stored in Redis, not in cookie
+   - Full logout (delete from Redis + revoke Keycloak token)
+   - Can track active sessions
+
+5. **Use Strong SECRET_KEY**
    - Generate using: `python3 -c "import secrets; print(secrets.token_hex(32))"`
    - Never commit to version control
 
-5. **Use HTTPS in Production**
+6. **Use HTTPS in Production**
    - Set `COOKIE_SECURE=True`
    - Set `secure=True` in cookie settings
 
-6. **Validate Redirect URIs**
+7. **Validate Redirect URIs**
    - Only allow whitelisted redirect URLs
    - Prevents open redirect vulnerabilities
 
-7. **Store Refresh Tokens Securely**
-   - Store in server-side session JWT
-   - Never expose to client-side JavaScript
+8. **Store Refresh Tokens in Redis**
+   - Never in localStorage or exposed to client
+   - Only backend has access via Redis
+
+9. **Use Session Rotation on Refresh**
+   - Session ID rotates every 4 minutes during refresh
+   - Prevents session fixation attacks
+   - Stolen cookies become useless after refresh
+
+10. **Full Logout**
+   - Revoke Keycloak refresh token
+   - Delete session from Redis
+   - Delete session cookie
+   - User must re-login to Keycloak
 
 ## ❌ DON'T
 
 1. **Don't Store Tokens in localStorage**
    - Vulnerable to XSS attacks
-   - Use httpOnly cookies instead
+   - Use httpOnly cookies + Redis instead
 
 2. **Don't Use Implicit Flow**
    - Tokens exposed in URL
@@ -1089,6 +1273,11 @@ export default Home;
 5. **Don't Allow Any Redirect URI**
    - Whitelist specific URLs only
    - Prevents authorization code leakage
+
+6. **Don't Store User Data in Cookie**
+   - Cookie should only have session_id (random string)
+   - User data stays in Redis
+   - If cookie stolen, attacker still needs Redis access
 
 ---
 
@@ -1122,11 +1311,29 @@ export default Home;
 - **Cause**: Refresh token expired or revoked
 - **Fix**: User needs to re-login
 
+## Issue: "Session not found" or "Invalid or expired session"
+- **Cause**: Redis session doesn't exist (expired or deleted)
+- **Fix**:
+  - Check Redis is running: `redis-cli ping`
+  - Check Redis connection in config
+  - User needs to re-login
+
+## Issue: Cannot connect to Redis
+- **Cause**: Redis not running or wrong connection string
+- **Fix**:
+  - Start Redis: `redis-server`
+  - Check REDIS_URL in .env matches your setup
+
 ---
 
 # RUNNING THE APPLICATION
 
-## 1. Start Keycloak
+## 1. Start Redis (Required!)
+```bash
+redis-server
+```
+
+## 2. Start Keycloak
 ```bash
 cd infra
 docker-compose up -d

@@ -1,5 +1,6 @@
 import logging
 import time
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.sessions import SessionMiddleware
@@ -7,14 +8,26 @@ from app.config import settings
 from app.db import init_db
 from app.routes import auth_router, notes_router
 from app.auth.dependencies import get_current_user
+from app.auth.redis_service import close_redis
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Notes API with Keycloak Authentication", version="1.0")
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("Starting up Notes API...")
+    init_db()
+    yield
+    logger.info("Shutting down Notes API...")
+    await close_redis()
+
+
+app = FastAPI(
+    title="Notes API with Keycloak Authentication", version="1.0", lifespan=lifespan
+)
 app.add_middleware(SessionMiddleware, secret_key=settings.SECRET_KEY, max_age=3600)
 app.add_middleware(
     CORSMiddleware,
@@ -35,12 +48,6 @@ async def log_requests(request: Request, call_next):
     )
     response.headers["X-Process-Time"] = str(process_time)
     return response
-
-
-@app.on_event("startup")
-async def startup():
-    logger.info("Starting up Notes API...")
-    init_db()
 
 
 @app.get("/")

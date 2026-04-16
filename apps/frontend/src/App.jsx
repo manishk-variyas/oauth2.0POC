@@ -4,7 +4,7 @@ import Login from './pages/Login';
 import Home from './pages/Home';
 import Public from './pages/Public';
 import Callback from './pages/Callback';
-import { checkAuth } from './services/auth';
+import { checkAuth, refreshSession } from './services/auth';
 
 const AuthContext = createContext(null);
 
@@ -22,6 +22,24 @@ function App() {
       setLoading(false);
     });
   }, []);
+
+  useEffect(() => {
+    if (!user) return;
+
+    const REFRESH_INTERVAL = 4 * 60 * 1000;
+
+    const interval = setInterval(async () => {
+      try {
+        await refreshSession();
+        console.log('Session refreshed');
+      } catch (error) {
+        console.error('Session refresh failed:', error);
+        setUser(null);
+      }
+    }, REFRESH_INTERVAL);
+
+    return () => clearInterval(interval);
+  }, [user]);
 
   const logout = async () => {
     const { logout: authLogout } = await import('./services/auth');
